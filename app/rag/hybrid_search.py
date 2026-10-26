@@ -17,9 +17,23 @@ def _get_bm25_index(corpus: tuple[str, ...]):
     return BM25Okapi(tokenized_chunks)
 
 
-def hybrid_search(question: str, chunks: Sequence[dict], top_k: int = 5) -> list[dict]:
+def hybrid_search(
+    question: str,
+    chunks: Sequence[dict],
+    top_k: int = 5,
+    dense_results: Sequence[dict] = (),
+) -> list[dict]:
     if not chunks:
-        return []
+        lexical_results = []
+    else:
+        lexical_results = _lexical_search(question, chunks, top_k)
+
+    if not dense_results:
+        return lexical_results
+    return _reciprocal_rank_fusion(lexical_results, dense_results, top_k)
+
+
+def _lexical_search(question: str, chunks: Sequence[dict], top_k: int) -> list[dict]:
     try:
         from rank_bm25 import BM25Okapi
     except ImportError:
@@ -37,4 +51,24 @@ def hybrid_search(question: str, chunks: Sequence[dict], top_k: int = 5) -> list
     return [
         {**chunks[index], "score": float(scores[index])}
         for index in ranked_indices[:top_k]
+    ]
+
+
+def _reciprocal_rank_fusion(
+    lexical_results: Sequence[dict],
+    dense_results: Sequence[dict],
+    top_k: int,
+) -> list[dict]:
+    scores: dict[str, float] = {}
+    chunks_by_id: dict[str, dict] = {}
+    for results in (lexical_results, dense_results):
+        for rank, chunk in enumerate(results, start=1):
+            chunk_id = chunk["chunk_id"]
+            chunks_by_id[chunk_id] = chunk
+            scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (60 + rank)
+
+    ranked_ids = sorted(scores, key=lambda chunk_id: scores[chunk_id], reverse=True)
+    return [
+        {**chunks_by_id[chunk_id], "score": scores[chunk_id]}
+        for chunk_id in ranked_ids[:top_k]
     ]

@@ -11,7 +11,7 @@ from app import config
 from app.api.documents import router as documents_router
 from app.api.predictions import router as predictions_router
 from app.api.questions import router as questions_router
-from app.llm.crew import CrewAIAnswerError
+from app.llm.crew import GeminiAnswerError
 from app.ml.predictor import evaluate_demo_model
 from app.ml.validation import summarize_healthcare_csv
 
@@ -25,10 +25,10 @@ app.include_router(questions_router, prefix="/api")
 app.include_router(predictions_router, prefix="/api")
 
 
-@app.exception_handler(CrewAIAnswerError)
-async def crewai_answer_error_handler(
+@app.exception_handler(GeminiAnswerError)
+async def gemini_answer_error_handler(
     request: Request,
-    exc: CrewAIAnswerError,
+    exc: GeminiAnswerError,
 ) -> JSONResponse:
     """Return a concise service error instead of an unhandled traceback."""
     return JSONResponse(

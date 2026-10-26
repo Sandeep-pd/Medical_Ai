@@ -9,6 +9,7 @@ from app import config
 from app.ingestion.layout_parser import ingest_document
 from app.ingestion.lab_extractor import extract_lab_results
 from app.rag.chunking import chunk_documents
+from app.rag.indexing import index_chunks
 
 router = APIRouter(tags=["documents"])
 indexed_chunks: list[dict] = []
@@ -41,6 +42,7 @@ async def upload_document(file: UploadFile = File(...)) -> dict:
 
     document_id = destination.stem
     chunks = chunk_documents(documents, document_id=document_id)
+    index_chunks(chunks)
     indexed_chunks.extend(chunks)
     return {
         "document_id": document_id,

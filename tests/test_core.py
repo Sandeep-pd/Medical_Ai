@@ -17,17 +17,32 @@ from app.ingestion.lab_extractor import extract_lab_results
 from app.ingestion.layout_parser import ingest_document
 from app.rag.chunking import chunk_documents
 from app.rag.hybrid_search import _get_bm25_index, hybrid_search
+from app.rag.indexing import collection_count, index_chunks, search_chroma
 from app.llm.safety import validate_question, validate_source_references
 from app.ml.predictor import evaluate_demo_model
 from app.llm.crew import (
-    CrewAIAnswerError,
+    GeminiAnswerError,
     GeminiQuotaExceededError,
     GeminiUnavailableError,
     GEMINI_QUOTA_EXHAUSTED_MESSAGE,
     TEMPORARY_GEMINI_UNAVAILABLE_MESSAGE,
-    run_medical_crew,
+    generate_medical_answer,
 )
 from app.llm.generator import generate_answer
+
+
+def make_genai_stub(generate_content):
+    types_stub = SimpleNamespace(
+        HttpOptions=lambda **kwargs: SimpleNamespace(**kwargs),
+        HttpRetryOptions=lambda **kwargs: SimpleNamespace(**kwargs),
+        GenerateContentConfig=lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    client = SimpleNamespace(
+        models=SimpleNamespace(generate_content=generate_content)
+    )
+    genai_stub = SimpleNamespace(Client=MagicMock(return_value=client))
+    google_stub = SimpleNamespace(genai=genai_stub)
+    return google_stub, SimpleNamespace(types=types_stub), genai_stub, client
 
 
 class CorePipelineTests(unittest.TestCase):
@@ -60,6 +75,71 @@ class CorePipelineTests(unittest.TestCase):
 
         self.assertEqual(_get_bm25_index.cache_info().hits, 1)
         _get_bm25_index.cache_clear()
+
+    def test_hybrid_search_fuses_lexical_and_dense_results(self):
+        chunks = [
+            {"chunk_id": "lexical", "text": "hemoglobin levels"},
+            {"chunk_id": "dense", "text": "blood test results"},
+        ]
+        dense_results = [
+            {**chunks[1], "score": 0.9},
+            {**chunks[0], "score": 0.2},
+        ]
+
+        results = hybrid_search("hemoglobin", chunks, top_k=2, dense_results=dense_results)
+
+        self.assertEqual({item["chunk_id"] for item in results}, {"lexical", "dense"})
+        self.assertGreater(results[0]["score"], 0)
+
+    def test_chroma_index_persists_and_returns_semantic_results(self):
+        class FakeVector:
+            def __init__(self, values):
+                self.values = values
+
+            def tolist(self):
+                return self.values
+
+        class FakeVectors(FakeVector):
+            def __getitem__(self, index):
+                return FakeVector(self.values[index])
+
+        model = MagicMock()
+        model.encode.side_effect = lambda texts, **kwargs: FakeVectors(
+            [[1.0, 0.0] for _ in texts]
+        )
+        collection = MagicMock()
+        collection.count.return_value = 1
+        collection.query.return_value = {
+            "ids": [["doc_p1_c0"]],
+            "documents": [["Hemoglobin result is normal."]],
+            "metadatas": [[{"document_id": "doc", "page": 1}]],
+            "distances": [[0.05]],
+        }
+        client = MagicMock()
+        client.get_or_create_collection.return_value = collection
+        chromadb_stub = SimpleNamespace(PersistentClient=MagicMock(return_value=client))
+        chunks = [{
+            "chunk_id": "doc_p1_c0",
+            "document_id": "doc",
+            "page": 1,
+            "text": "Hemoglobin result is normal.",
+        }]
+
+        with (
+            patch.dict(sys.modules, {"chromadb": chromadb_stub}),
+            patch("app.rag.indexing.config.CHROMA_DIR", Path("data/chroma")),
+            patch("app.rag.indexing.get_embedding_model", return_value=model),
+        ):
+            index_chunks(chunks)
+            self.assertEqual(1, collection_count())
+            results = search_chroma("hemoglobin", top_k=1)
+
+        chromadb_stub.PersistentClient.assert_called_with(path="data\\chroma")
+        collection.upsert.assert_called_once()
+        self.assertEqual(results[0]["chunk_id"], "doc_p1_c0")
+        self.assertEqual(results[0]["text"], "Hemoglobin result is normal.")
+        self.assertEqual(results[0]["document_id"], "doc")
+        self.assertGreater(results[0]["score"], 0.9)
 
     def test_question_and_citation_validation(self):
         self.assertFalse(validate_question("  ")[0])
@@ -125,10 +205,10 @@ class CorePipelineTests(unittest.TestCase):
         try:
             with (
                 patch("app.api.questions.hybrid_search", return_value=documents_api.indexed_chunks),
-                patch("app.api.questions.rerank_results", return_value=documents_api.indexed_chunks),
+                patch("app.api.questions.search_chroma", return_value=[]),
                 patch(
                     "app.api.questions.generate_answer",
-                    side_effect=CrewAIAnswerError(
+                    side_effect=GeminiAnswerError(
                         "Gemini API request failed."
                     ),
                 ),
@@ -142,10 +222,40 @@ class CorePipelineTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json(), {
-            "error": "crewai_answer_error",
+            "error": "gemini_answer_error",
             "detail": "Gemini API request failed.",
             "retryable": False,
         })
+
+    def test_question_endpoint_accepts_valid_json_and_returns_sources(self):
+        documents_api.indexed_chunks[:] = [{
+            "chunk_id": "doc_p1_c0",
+            "document_id": "doc",
+            "page": 1,
+            "text": "The report says the patient had a cough.",
+        }]
+        try:
+            with (
+                patch("app.api.questions.search_chroma", return_value=[]),
+                patch(
+                    "app.api.questions.hybrid_search",
+                    return_value=documents_api.indexed_chunks,
+                ),
+                patch(
+                    "app.api.questions.generate_answer",
+                    return_value="The report notes a cough [Source 1].",
+                ),
+            ):
+                response = TestClient(app).post(
+                    "/api/questions",
+                    json={"question": "What symptom does the report mention?"},
+                )
+        finally:
+            documents_api.indexed_chunks.clear()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["answer"], "The report notes a cough [Source 1].")
+        self.assertEqual(response.json()["sources"][0]["chunk_id"], "doc_p1_c0")
 
     def test_gemini_unavailable_returns_only_friendly_503_message(self):
         documents_api.indexed_chunks[:] = [{
@@ -157,7 +267,7 @@ class CorePipelineTests(unittest.TestCase):
         try:
             with (
                 patch("app.api.questions.hybrid_search", return_value=documents_api.indexed_chunks),
-                patch("app.api.questions.rerank_results", return_value=documents_api.indexed_chunks),
+                patch("app.api.questions.search_chroma", return_value=[]),
                 patch(
                     "app.api.questions.generate_answer",
                     side_effect=GeminiUnavailableError(
@@ -189,7 +299,7 @@ class CorePipelineTests(unittest.TestCase):
         try:
             with (
                 patch("app.api.questions.hybrid_search", return_value=documents_api.indexed_chunks),
-                patch("app.api.questions.rerank_results", return_value=documents_api.indexed_chunks),
+                patch("app.api.questions.search_chroma", return_value=[]),
                 patch(
                     "app.api.questions.generate_answer",
                     side_effect=GeminiQuotaExceededError(
@@ -212,102 +322,131 @@ class CorePipelineTests(unittest.TestCase):
         })
         generate.assert_called_once()
 
-    def test_crew_converts_gemini_503_to_short_message(self):
-        crewai_stub = MagicMock()
-        crewai_stub.Agent.side_effect = lambda **kwargs: SimpleNamespace(**kwargs)
-        crewai_stub.Task.side_effect = lambda **kwargs: SimpleNamespace(**kwargs)
-        crewai_stub.Process.sequential = "sequential"
-        crewai_stub.Crew.return_value.kickoff.side_effect = RuntimeError(
-            "503 UNAVAILABLE: This model is currently experiencing high demand."
+    def test_gemini_request_converts_503_to_short_message(self):
+        error = RuntimeError(
+            "Google Gemini API error: 503 - This model is currently experiencing "
+            "high demand. Spikes in demand are usually temporary. Please try again later."
         )
+        generate_content = MagicMock(side_effect=[error] * 3)
+        google_stub, types_stub, _, _ = make_genai_stub(generate_content)
         with (
-            patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}),
-            patch.dict(sys.modules, {"crewai": crewai_stub}),
+            patch.dict(os.environ, {
+                "GEMINI_API_KEY": "test-key",
+                "GEMINI_MODEL_IDS": (
+                    "models/gemini-3.5-flash-lite,"
+                    "models/gemini-3.5-flash,"
+                    "models/gemini-3.6-flash"
+                ),
+            }),
+            patch.dict(sys.modules, {"google": google_stub, "google.genai": types_stub}),
         ):
             with self.assertRaises(GeminiUnavailableError) as error:
-                run_medical_crew("Question?", "Evidence.")
+                generate_medical_answer("Question?", "Evidence.")
+
+        self.assertEqual(str(error.exception), TEMPORARY_GEMINI_UNAVAILABLE_MESSAGE)
+        self.assertEqual(
+            [call.kwargs["model"] for call in generate_content.call_args_list],
+            [
+                "models/gemini-3.5-flash-lite",
+                "models/gemini-3.5-flash",
+                "models/gemini-3.6-flash",
+            ],
+        )
+
+    def test_gemini_request_converts_504_to_short_message(self):
+        error = RuntimeError(
+            "504 DEADLINE_EXCEEDED: Deadline expired before operation could complete."
+        )
+        generate_content = MagicMock(side_effect=[error] * 3)
+        google_stub, types_stub, _, _ = make_genai_stub(generate_content)
+        with (
+            patch.dict(os.environ, {
+                "GEMINI_API_KEY": "test-key",
+                "GEMINI_MODEL_IDS": (
+                    "models/gemini-3.5-flash-lite,"
+                    "models/gemini-3.5-flash,"
+                    "models/gemini-3.6-flash"
+                ),
+            }),
+            patch.dict(sys.modules, {"google": google_stub, "google.genai": types_stub}),
+        ):
+            with self.assertRaises(GeminiUnavailableError) as error:
+                generate_medical_answer("Question?", "Evidence.")
 
         self.assertEqual(str(error.exception), TEMPORARY_GEMINI_UNAVAILABLE_MESSAGE)
 
-    def test_crew_converts_gemini_quota_error_and_stops(self):
-        crewai_stub = MagicMock()
-        crewai_stub.Agent.side_effect = lambda **kwargs: SimpleNamespace(**kwargs)
-        crewai_stub.Task.side_effect = lambda **kwargs: SimpleNamespace(**kwargs)
-        crewai_stub.Process.sequential = "sequential"
-        crewai_stub.Crew.return_value.kickoff.side_effect = RuntimeError(
-            "429 RESOURCE_EXHAUSTED: You exceeded your current quota."
-        )
+    def test_gemini_request_converts_quota_error(self):
+        error = RuntimeError("429 RESOURCE_EXHAUSTED: You exceeded your current quota.")
+        generate_content = MagicMock(side_effect=[error] * 3)
+        google_stub, types_stub, _, _ = make_genai_stub(generate_content)
         with (
-            patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}),
-            patch.dict(sys.modules, {"crewai": crewai_stub}),
+            patch.dict(os.environ, {
+                "GEMINI_API_KEY": "test-key",
+                "GEMINI_MODEL_IDS": (
+                    "models/gemini-3.5-flash-lite,"
+                    "models/gemini-3.5-flash,"
+                    "models/gemini-3.6-flash"
+                ),
+            }),
+            patch.dict(sys.modules, {"google": google_stub, "google.genai": types_stub}),
         ):
             with self.assertRaises(GeminiQuotaExceededError) as error:
-                run_medical_crew("Question?", "Evidence.")
+                generate_medical_answer("Question?", "Evidence.")
 
         self.assertEqual(str(error.exception), GEMINI_QUOTA_EXHAUSTED_MESSAGE)
-        crewai_stub.Crew.return_value.kickoff.assert_called_once()
+        self.assertEqual(generate_content.call_count, 3)
 
-    def test_three_agent_crew_uses_configured_gemini_model_and_context(self):
-        created_agents = []
-        created_tasks = []
-        created_crews = []
-
-        def make_agent(**kwargs):
-            agent = SimpleNamespace(**kwargs)
-            created_agents.append(agent)
-            return agent
-
-        def make_task(**kwargs):
-            task = SimpleNamespace(**kwargs)
-            created_tasks.append(task)
-            return task
-
-        class StubCrew:
-            def __init__(self, **kwargs):
-                self.options = kwargs
-                created_crews.append(self)
-
-            def kickoff(self, inputs):
-                self.inputs = inputs
-                return SimpleNamespace(raw="Supported answer [Source 1].")
-
-        crewai_stub = SimpleNamespace(
-            Agent=make_agent,
-            Crew=StubCrew,
-            LLM=lambda **kwargs: SimpleNamespace(**kwargs),
-            Process=SimpleNamespace(sequential="sequential"),
-            Task=make_task,
+    def test_gemini_answer_uses_one_bounded_safety_checked_request(self):
+        generate_content = MagicMock(
+            side_effect=[
+                RuntimeError("model not found"),
+                SimpleNamespace(text="Supported answer [Source 1]."),
+            ]
         )
+        google_stub, types_stub, genai_stub, client = make_genai_stub(generate_content)
         with (
-            patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}),
-            patch.dict(sys.modules, {"crewai": crewai_stub}),
+            patch.dict(os.environ, {
+                "GEMINI_API_KEY": "test-key",
+                "GEMINI_MODEL_IDS": (
+                    "models/gemini-3.5-flash-lite,"
+                    "models/gemini-3.5-flash,"
+                    "models/gemini-3.6-flash"
+                ),
+            }),
+            patch.dict(sys.modules, {"google": google_stub, "google.genai": types_stub}),
         ):
-            answer = run_medical_crew("Question?", "Evidence.")
+            answer = generate_medical_answer("Question?", "Evidence.")
 
         self.assertEqual(answer, "Supported answer [Source 1].")
+        genai_stub.Client.assert_called_once()
+        client_options = genai_stub.Client.call_args.kwargs
         self.assertEqual(
-            created_agents[0].llm.model,
-            "gemini/gemini-3.8-flash",
+            client_options["http_options"].timeout,
+            10_000,
         )
-        self.assertEqual(len(created_agents), 3)
-        self.assertEqual(len(created_tasks), 3)
-        self.assertIn("{context}", created_tasks[1].description)
-        self.assertEqual(created_crews[0].options["process"], "sequential")
-        self.assertFalse(created_crews[0].options["tracing"])
-        self.assertFalse(created_crews[0].options["share_crew"])
         self.assertEqual(
-            created_crews[0].inputs,
-            {"question": "Question?", "context": "Evidence."},
+            client_options["http_options"].retry_options.attempts,
+            1,
         )
+        self.assertEqual(
+            [call.kwargs["model"] for call in generate_content.call_args_list],
+            ["models/gemini-3.5-flash-lite", "models/gemini-3.5-flash"],
+        )
+        prompt = generate_content.call_args.kwargs["contents"]
+        self.assertIn("general medical", prompt)
+        self.assertIn("do not infer a diagnosis", prompt)
+        self.assertIn("Question:\nQuestion?", prompt)
+        self.assertIn("Retrieved passages:\nEvidence.", prompt)
+        self.assertEqual(generate_content.call_args.kwargs["config"].max_output_tokens, 350)
 
-    def test_three_agent_crew_requires_api_key(self):
-        with patch.dict(os.environ, {"GEMINI_API_KEY": ""}):
+    def test_gemini_answer_requires_api_key(self):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": ""}):
             with self.assertRaisesRegex(RuntimeError, "GEMINI_API_KEY"):
-                run_medical_crew("Question?", "Evidence.")
+                generate_medical_answer("Question?", "Evidence.")
 
-    def test_answer_generator_uses_three_agent_crew(self):
+    def test_answer_generator_uses_grounded_answer_generation(self):
         with patch(
-            "app.llm.generator.run_medical_crew",
+            "app.llm.generator.generate_medical_answer",
             return_value="Final answer.",
         ) as run_crew:
             answer = generate_answer("Question?", "Evidence.")

@@ -1,476 +1,286 @@
 # Medical AI RAG
 
-A small FastAPI application for uploading healthcare documents, extracting their
-text, retrieving relevant passages, and asking questions about the uploaded
-content. It also includes a CSV summary command and a demonstration prediction
-endpoint.
+A FastAPI application that accepts healthcare documents, extracts and indexes
+their text, retrieves relevant passages for a question, and sends those
+passages to Gemini to draft a cited answer.
 
-> **Important:** The prediction endpoint uses a model trained on synthetic
-> example data. It is not trained on the uploaded healthcare CSV and must not be
-> used for diagnosis, treatment, or any clinical decision. Generated answers
-> can also be wrong; verify important information against the source document
-> and a qualified professional.
+> **Not for clinical use:** generated answers can be wrong. Verify important
+> statements against the source document and a qualified professional. The
+> separate prediction endpoint is a synthetic-data demo, not a medical model.
 
- 1. Project layout
+## What it does
+
+1. **Accepts a document:** CSV, DOCX, PDF, PNG, JPG, or JPEG.
+2. **Extracts text:** reads CSV rows, DOCX paragraphs and tables, PDF text (with
+   OCR for scanned pages), or image text using OCR.
+3. **Chunks and indexes the text:** saves chunks in persistent ChromaDB with
+   embeddings from `sentence-transformers/all-MiniLM-L6-v2`.
+4. **Retrieves evidence for a question:** combines ChromaDB semantic matches
+   with BM25 keyword matches using reciprocal-rank fusion.
+5. **Builds cited sources:** includes document ID, page, chunk ID, and passage.
+6. **Generates an answer:** asks Gemini to answer from the evidence, preserve
+   values and units, cite source labels, and not infer a patient diagnosis.
+
+Gemini models are tried in configured order. The default order is
+`models/gemini-3.5-flash-lite`, `models/gemini-3.5-flash`, then
+`models/gemini-3.6-flash`. Each attempt has a 10-second timeout. A successful
+model stops the fallback sequence; if all fail, the API returns a structured
+error. If all three models time out, a request can take up to about 30 seconds.
+
+## Project structure
 
 ```text
-medical-ai-rag/
+Medical_AI/
 ├── app/
-│   ├── main.py                 # FastAPI app and CLI
-│   ├── config.py               # Paths and upload settings
-│   ├── api/                    # Upload, question, and prediction routes
-│   ├── ingestion/              # CSV, DOCX, PDF, and image text extraction
-│   ├── rag/                    # Chunking, search, reranking, and citations
-│   ├── ml/                     # Demo prediction and CSV summary
-│   ├── llm/                    # Gemini CrewAI agents and safety checks
-│   └── schemas/                # Request and response validation
+│   ├── main.py                  # FastAPI app, health endpoint, CLI
+│   ├── config.py                # Environment settings and storage paths
+│   ├── api/
+│   │   ├── documents.py         # Upload and ingest documents
+│   │   ├── questions.py         # Retrieve evidence and answer questions
+│   │   └── predictions.py       # Synthetic demo prediction endpoints
+│   ├── ingestion/
+│   │   ├── layout_parser.py     # CSV, DOCX, and PDF extraction
+│   │   ├── ocr.py               # Image/scanned-page OCR
+│   │   └── lab_extractor.py     # Extract matching laboratory result patterns
+│   ├── rag/
+│   │   ├── chunking.py          # Split extracted text into chunks
+│   │   ├── embeddings.py        # Load the sentence-transformer
+│   │   ├── indexing.py          # Persistent ChromaDB write and search
+│   │   ├── hybrid_search.py     # BM25 keyword search and rank fusion
+│   │   └── citations.py         # Format evidence and source labels
+│   ├── llm/
+│   │   ├── generator.py         # Answer-generation entry point
+│   │   ├── crew.py              # Gemini calls, model fallback, error mapping
+│   │   └── safety.py            # Question and citation validation helpers
+│   ├── ml/                      # Separate synthetic demo prediction model
+│   └── schemas/                 # Validated API request/response models
 ├── data/
-│   ├── medical.csv             # Default CSV for summary command
-│   └── documents/              # Uploaded files
-├── models/                     # Reserved model storage
-├── tests/
+│   ├── medical.csv              # Default CSV for the summary CLI
+│   ├── documents/               # Uploaded source files
+│   └── chroma/                  # Persistent ChromaDB files
+├── models/                      # Reserved model storage
+├── tests/test_core.py           # Focused pipeline and API tests
 ├── requirements.txt
 ├── Dockerfile
 └── .env.example
 ```
 
- 2. Requirements and installation
+## Technologies used
 
-Use Python 3.10 or newer. From the project root, create and activate a virtual
-environment in PowerShell:
+| Technology | Purpose |
+|---|---|
+| Python | Application language |
+| FastAPI, Uvicorn | HTTP API and development server |
+| Pydantic | Validate API requests and responses |
+| ChromaDB | Persistent vector database for document chunks |
+| Sentence Transformers | Create text embeddings for semantic retrieval |
+| BM25 (`rank-bm25`) | Keyword retrieval, combined with vector search |
+| Google Gen AI (`google-genai`) | Generate evidence-grounded answers with Gemini |
+| PyMuPDF, python-docx, pandas | Read PDF, DOCX, and CSV documents |
+| PaddleOCR, Pillow | OCR for scanned documents and images |
+| scikit-learn, XGBoost | Supporting dependencies for the demo ML pipeline |
+
+## Requirements and installation
+
+Use Python 3.10 or newer. From PowerShell at the project root:
 
 ```powershell
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements.txt
-```
-
-Create the local settings file from the sample:
-
-```powershell
 Copy-Item .env.example .env
 ```
 
-Open `.env` and set `GEMINI_API_KEY` to a key created in Google AI Studio.
-Keep `.env` private; it is ignored by Git. Do not paste the key into source
-files, screenshots, or support messages. If a key has been shared, revoke it
-and use a new key.
+Edit `.env` and set `GEMINI_API_KEY` or `GOOGLE_API_KEY` to a key with Gemini
+API access. Keep the key private; `.env` is excluded from Git. Do not put API
+keys in source code or paste them into logs or screenshots.
 
-If PowerShell blocks activation, run the commands using the virtual environment
-interpreter directly:
+OCR and embedding packages can be large. On the first upload or question, the
+embedding model is loaded and may be downloaded. Later questions reuse it.
+Gemini API calls require internet access.
 
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-```
+## Configuration
 
-The requirements include OCR, document parsing, ML, and Gemini API dependencies.
-Some packages are large and may take time to install. PaddleOCR may require
-platform-specific installation adjustments; see its installation instructions
-if installation fails. Gemini generation uses the Google GenAI API over the
-internet and does not download a local text-generation model.
-
-3. Configuration: where to set parameters
-
-Application settings are read from environment variables in
-[`app/config.py`](app/config.py). The file `.env.example` documents the
-available names. The app loads a project-root `.env` file automatically when
-`python-dotenv` is installed (it is included in `requirements.txt`). Environment
-variables already defined in the shell take precedence over values from `.env`.
+Settings are loaded in [`app/config.py`](app/config.py). Shell environment
+variables override values from the project-root `.env` file.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `DATA_DIR` | `data` | Base directory for data |
-| `DOCUMENTS_DIR` | `data/documents` | Where uploaded files are saved |
+| `DATA_DIR` | `data` | Base data directory |
+| `DOCUMENTS_DIR` | `data/documents` | Uploaded source files |
+| `CHROMA_DIR` | `data/chroma` | Persistent ChromaDB data |
 | `MODEL_DIR` | `models` | Reserved model directory |
-| `DATASET_PATH` | `data/medical.csv` | CSV used by the CLI summary |
-| `MAX_UPLOAD_BYTES` | `20971520` (20 MiB) | Maximum upload size |
-| `GEMINI_API_KEY` | unset | Required key for Gemini answer generation |
-| `GEMINI_MODEL_ID` | `gemini-3.8-flash` | Gemini model used to generate answers |
-| `CREWAI_TRACING_ENABLED` | `false` for this app's Crew | Keep CrewAI tracing prompts/sharing disabled |
+| `DATASET_PATH` | `data/medical.csv` | CSV used by the summary CLI |
+| `MAX_UPLOAD_BYTES` | `20971520` | Maximum upload size (20 MiB) |
+| `GEMINI_API_KEY` / `GOOGLE_API_KEY` | unset | Gemini API key; set at least one |
+| `GEMINI_MODEL_IDS` | See below | Comma-separated model fallback order |
 
-Example PowerShell configuration:
+Default model order:
+
+```text
+models/gemini-3.5-flash-lite,models/gemini-3.5-flash,models/gemini-3.6-flash
+```
+
+Change the fallback sequence by editing `GEMINI_MODEL_IDS` in `.env`. Retrieval
+defaults are set in code: 800-character chunks, 120-character overlap, up to 10
+search candidates, and up to 3 cited sources.
+
+## Run the API
+
+Start from the project root:
 
 ```powershell
-$env:DATASET_PATH = "C:\path\to\my-healthcare.csv"
-$env:MAX_UPLOAD_BYTES = "52428800"
-$env:GEMINI_API_KEY = "your-api-key"
-$env:GEMINI_MODEL_ID = "gemini-3.8-flash"
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-Changes to settings such as `DOCUMENTS_DIR` need to be made before launching
-the Python process. The configured directories are created automatically when
-the app starts or receives an upload. Copy `.env.example` to `.env` and replace
-the key placeholder with a valid key. `.env` is excluded from Git; never commit
-or share it.
-Crew tracing and Crew sharing are explicitly disabled for web requests, so the
-terminal will not ask a Y/N trace-sharing question. This also prevents retrieved
-document text from being uploaded to CrewAI as an execution trace.
+If port 8000 is already in use, use another port, for example `--port 8001`.
+The server stays in the terminal until stopped with **Ctrl+C**.
 
-Other processing parameters are code defaults:
+Useful URLs (replace the port if necessary):
 
-| Parameter | Default | Where it is set |
-|---|---:|---|
-| Chunk size | 800 characters | `chunk_documents()` in `app/rag/chunking.py` |
-| Chunk overlap | 120 characters | `chunk_documents()` in `app/rag/chunking.py` |
-| Number of search candidates | 10 | `ask_question()` in `app/api/questions.py` |
-| Number of final sources | 3 | `ask_question()` in `app/api/questions.py` |
-| Maximum answer tokens per agent call | 350 | `generate_answer()` in `app/llm/generator.py` |
-| Answer model | `gemini-3.8-flash` | `GEMINI_MODEL_ID` environment variable |
-| Reranker | `cross-encoder/ms-marco-MiniLM-L-6-v2` | `app/rag/reranker.py` |
+| URL | What to check |
+|---|---|
+| `http://127.0.0.1:8000/health` | API health; should return `{"status":"ok"}` |
+| `http://127.0.0.1:8000/docs` | Swagger UI to try the API interactively |
+| `http://127.0.0.1:8000/openapi.json` | OpenAPI definition |
 
-To change these defaults, edit the corresponding module. The API does not
-currently accept chunk size, candidate count, model name, or generation length
-as request parameters.
+## Try uploading and asking a question
 
-4. Start the API
-
-From the project root:
+### 1. Check health
 
 ```powershell
-uvicorn app.main:app --reload
+Invoke-RestMethod -Uri "http://127.0.0.1:8000/health"
 ```
 
-The server listens at `http://127.0.0.1:8000` by default.
+Expected response:
 
-Alternative: start via the CLI. This prints a summary of the configured CSV
-when it exists, then starts the API:
-
-```powershell
-python -m app.main
+```text
+status
+------
+ok
 ```
 
-Specify a different CSV or server address:
+### 2. Upload a document
 
-```powershell
-python -m app.main --dataset "C:\data\medical.csv" --host 0.0.0.0 --port 8080
-```
-
-Print only the CSV summary and exit (does not start the API):
-
-```powershell
-python -m app.main --summary-only --dataset "data\medical.csv"
-```
-
-Evaluate the demonstration prediction model and print its metrics as JSON:
-
-```powershell
-python -m app.main --evaluate-model
-```
-
-This command trains the demo model on a fixed synthetic dataset, evaluates it
-on a held-out 20% test split, prints the metrics, and exits without starting
-the API. The test data is not used for fitting the model.
-
-The compatibility script can also be used:
-
-```powershell
-python untitled129.py --summary-only
-```
-
-5. How to use the endpoints
-
-Interactive API documentation is available at:
-
-- Swagger UI: `http://127.0.0.1:8000/docs`
-- OpenAPI schema: `http://127.0.0.1:8000/openapi.json`
-
-Check that the server is running
-
-Request:
-
-```http
-GET /health
-```
-
-Example response:
-
-```json
-{"status": "ok"}
-```
-
- Upload a CSV, DOCX, PDF, or image
-
-Upload one file at a time using `POST /api/documents`. Supported extensions are
-`.csv`, `.docx`, `.pdf`, `.png`, `.jpg`, and `.jpeg`.
-
-In Swagger UI, expand **POST `/api/documents`**, choose **Try it out**, select
-the file in the `file` field, and click **Execute**.
-
-PowerShell example:
-
-```powershell
-curl.exe -X POST "http://127.0.0.1:8000/api/documents" `
-  -F "file=@C:\path\to\report.docx"
-```
-
-CSV example:
-
-```powershell
-curl.exe -X POST "http://127.0.0.1:8000/api/documents" `
-  -F "file=@C:\path\to\records.csv"
-```
-
-PDF example:
+Use a real local file path:
 
 ```powershell
 curl.exe -X POST "http://127.0.0.1:8000/api/documents" `
   -F "file=@C:\path\to\report.pdf"
 ```
 
-The `file` field is the only upload parameter. The original upload is saved
-under `data/documents/` using a generated ID as its filename. Its extracted
-text is split into chunks and kept in application memory for questions.
+Supported extensions are `.csv`, `.docx`, `.pdf`, `.png`, `.jpg`, and `.jpeg`.
+The response reports the generated `document_id`, page count, chunk count, and
+any extracted laboratory results. The original file is saved under
+`data/documents/`; its chunks are stored in `data/chroma/`.
 
-Example response:
+### 3. Ask a question
 
-```json
-{
-  "document_id": "generated-id",
-  "filename": "report.docx",
-  "pages": 1,
-  "chunks": 2,
-  "laboratory_results": []
-}
-```
-
-The `laboratory_results` array is populated when the text matches the
-extractor's expected pattern, for example:
-`Hemoglobin 13.5 g/dL 12.0 - 16.0`.
-
-Upload errors include:
-
-| Status | Meaning |
-|---:|---|
-| `400` | Empty upload |
-| `413` | File exceeds `MAX_UPLOAD_BYTES` |
-| `415` | Extension is not supported |
-| `422` | File could not be read or contains no usable text |
-
-CSV uploads are converted to text with column names and row values. DOCX
-paragraphs and table rows are extracted. PDFs first use embedded text; pages
-without enough embedded text fall back to OCR. Image uploads use OCR directly.
-OCR requires the PaddleOCR dependencies and may download model assets on first
-use.
-
-# Ask a question about uploaded documents
-
-Upload a document first, then use `POST /api/questions`.
-
-Request JSON:
-
-```json
-{
-  "question": "What hemoglobin value and reference range are reported?"
-}
-```
-
-The `question` parameter is required, must contain 1–2000 characters, and is
-sent in the JSON body. Example:
+PowerShell example:
 
 ```powershell
-curl.exe -X POST "http://127.0.0.1:8000/api/questions" `
-  -H "Content-Type: application/json" `
-  -d '{\"question\":\"What hemoglobin value and reference range are reported?\"}'
+$body = @{ question = "What hemoglobin value and reference range are reported?" } |
+  ConvertTo-Json -Compress
+
+Invoke-RestMethod `
+  -Uri "http://127.0.0.1:8000/api/questions" `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body $body
 ```
 
-Example response shape:
+The response contains the question, generated answer, and cited sources. In
+Swagger UI, expand **POST `/api/questions`**, select **Try it out**, replace the
+example with valid JSON, and click **Execute**:
 
 ```json
-{
-  "question": "What hemoglobin value and reference range are reported?",
-  "answer": "The report gives a value of 13.5 g/dL [Source 1].",
-  "sources": [
-    {
-      "source_label": "Source 1",
-      "document_id": "generated-id",
-      "page": 1,
-      "chunk_id": "generated-id_p1_c0",
-      "text": "Hemoglobin 13.5 g/dL 12.0 - 16.0"
-    }
-  ]
-}
+{"question":"What hemoglobin value and reference range are reported?"}
 ```
 
-The retrieved text is sent to a three-agent CrewAI pipeline. The agents run
-sequentially: (1) an evidence analyst extracts relevant details, (2) a verifier
-checks support and citations against the passages, and (3) a response writer
-produces the final answer. Each agent uses the Gemini model configured by
-`GEMINI_MODEL_ID` (default `gemini-3.8-flash`), so one question can make several
-Gemini calls. The server needs internet access and a valid `GEMINI_API_KEY`.
-The first question may also download the cross-encoder reranker. If the key is
-missing, CrewAI is not installed, or a Gemini request fails, the endpoint
-returns a structured JSON error response instead of an unhandled server error.
-If Gemini reports `503 UNAVAILABLE` or temporary high demand, the API response
-is HTTP 503 with a concise detail and `retryable: true`, so the web client can
-show the message and offer retry.
-If Gemini reports `429 RESOURCE_EXHAUSTED` or an exhausted quota, the crew
-stops processing and the API returns HTTP 429 with `retryable: false`. No
-further agents run for that failed request.
+Use `ConvertTo-Json` in PowerShell or a JSON-aware client to avoid malformed
+request bodies. `422 Unprocessable Content` commonly means the request body
+wasn't valid JSON or the `question` field was empty or longer than 2000
+characters.
 
-Example temporary-overload response:
+### 4. Check whether a question succeeded
 
-```json
-{
-  "error": "gemini_temporarily_unavailable",
-  "detail": "Gemini is currently experiencing high demand. Please try again shortly.",
-  "retryable": true
-}
-```
+- **200:** answer and cited sources returned.
+- **404:** upload a document before asking.
+- **422:** check the request JSON and question length.
+- **429:** all configured models reported quota exhaustion.
+- **503:** all configured models failed or Gemini is temporarily unavailable.
+  Check the server terminal, API key, model access, and internet connection.
 
-Example quota-exhausted response:
+The first question can take longer because it loads the embedding model. Warm
+retrieval reuses the model and ChromaDB collection. The model fallback affects
+answer generation, not vector retrieval.
 
-```json
-{
-  "error": "gemini_quota_exhausted",
-  "detail": "Gemini quota is exhausted. Please check your API quota or billing.",
-  "retryable": false
-}
-```
-
-To check that the application loaded the key without printing the secret, run
-this from the project root:
-
-```powershell
-python -c "import os; from app import config; print('Gemini key configured:', bool(os.getenv('GEMINI_API_KEY')))"
-```
-
-It should print `Gemini key configured: True`. Then restart the API after
-changing `.env`, upload a document, and send a question. A successful
-`GET /health` only confirms that the API is running; it does not verify the
-Gemini key or model access.
-
-Current implementation notes:
-
-- The question endpoint searches the chunks uploaded during the current server
-  process. Restarting the server clears this in-memory index; upload the
-  documents again after a restart.
-- Search currently uses BM25 lexical ranking, followed by the optional
-  cross-encoder reranker. Although embedding and Qdrant helper modules exist,
-  they are not currently wired into this endpoint.
-- There is no delete-document endpoint yet. Uploaded source files remain in
-  `data/documents/` until you remove them yourself.
-- The BM25 index and reranker model are cached between questions in the same
-  server process to reduce repeated retrieval setup time. The three CrewAI
-  agents still make separate Gemini calls for each question.
-
-### Get a demonstration prediction
-
-`POST /api/predictions` accepts exactly four finite numeric values in
-`features`:
-
-```json
-{
-  "features": [0.8, -0.3, 0.5, 0.1]
-}
-```
-
-Example:
-
-```powershell
-curl.exe -X POST "http://127.0.0.1:8000/api/predictions" `
-  -H "Content-Type: application/json" `
-  -d '{\"features\":[0.8,-0.3,0.5,0.1]}'
-```
-
-Example response:
-
-```json
-{"score": 0.72}
-```
-
-The score is a synthetic demo model's probability-like output between 0 and 1.
-It is not a prediction for an actual patient's diagnosis or outcome. The
-endpoint trains this demonstration model on synthetic data the first time it is
-called; it does not read `data/medical.csv`.
-
-### Evaluate the demonstration prediction model
-
-You can inspect the same evaluation through `GET /api/predictions/evaluation`:
-
-```powershell
-curl.exe "http://127.0.0.1:8000/api/predictions/evaluation"
-```
-
-The response includes accuracy, precision, recall, F1 score, ROC-AUC, a
-confusion matrix, per-class classification metrics, feature importance, and
-the train/test split details. The confusion matrix uses this order:
-`[[true_negative, false_positive], [false_negative, true_positive]]`.
-
-These metrics measure performance only on the generated synthetic demo data.
-They are not evaluation results for the healthcare CSV and do not show medical
-accuracy or suitability for real patient data.
-
-## 6. CSV summary output
-
-The summary command reads `DATASET_PATH` (by default `data/medical.csv`) and
-prints JSON containing:
-
-- row and column counts
-- column names and inferred data types
-- missing-value counts
-- the first five rows
-- medical-condition distribution, if that column exists
-- test-result distribution, if that column exists
-
-It does not train a clinical model. To summarize another CSV:
-
-```powershell
-python -m app.main --summary-only --dataset "C:\data\another.csv"
-```
-
-## 7. Run tests
+## Run the tests
 
 From the project root:
 
 ```powershell
-python -m unittest discover -s tests -v
+python -m unittest discover -s tests -p test_core.py
 ```
 
-The tests cover CSV and DOCX extraction, chunking/search, lab parsing, and
-question/citation validation.
+The focused suite checks ingestion, chunking, ChromaDB integration, retrieval
+fusion, the question API response, and Gemini fallback/error handling. Tests
+mock external Gemini requests; a passing suite does not verify the live API key
+or remote model availability.
 
-## 8. Docker
+## Other available commands and endpoints
 
-Build and start the container from the project root:
+### Synthetic prediction demo
+
+`POST /api/predictions` accepts exactly four numeric features. This is a
+synthetic demonstration only; it is unrelated to uploaded documents and must
+not be used for patient diagnosis or treatment.
 
 ```powershell
-docker build -t medical-ai-rag .
-docker run --rm -p 8000:8000 medical-ai-rag
+$body = @{ features = @(0.8, -0.3, 0.5, 0.1) } | ConvertTo-Json -Compress
+Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/predictions" `
+  -Method Post -ContentType "application/json" -Body $body
 ```
 
-The Docker image copies the `data/` directory into the container. Uploaded
-documents and in-memory search data are not persisted outside the container
-unless you mount a host directory. For persistent uploads, for example:
+`GET /api/predictions/evaluation` reports metrics on synthetic demo data.
+
+### CSV summary CLI
+
+Print a summary of the configured dataset:
 
 ```powershell
-docker run --rm -p 8000:8000 `
-  -v "C:\medical-ai-data:/app/data" `
-  medical-ai-rag
+python -m app.main --summary-only
 ```
 
-The Docker image installs the full dependency list, including large ML/OCR
-packages. Consider trimming `requirements.txt` for a lightweight deployment
-that does not need every optional feature. The container does not include your
-local `.env`; pass settings securely when starting it, for example with
-`--env-file .env` (do not publish that file).
+Choose a different CSV:
 
-## 9. Troubleshooting
+```powershell
+python -m app.main --summary-only --dataset "C:\path\to\data.csv"
+```
 
-- **`Upload a document before asking a question`**: upload a document to
-  `/api/documents` first, in the same running server session.
-- **`DOCX ingestion requires python-docx`**: install dependencies with
-  `pip install -r requirements.txt`.
-- **PDF import errors**: ensure `pymupdf` is installed.
-- **Image/scanned PDF OCR errors**: ensure Pillow, PaddleOCR, and the compatible
-  PaddlePaddle package are installed.
-- **`GEMINI_API_KEY` is missing**: confirm `.env` exists in the project root
-  and contains the key assignment, then restart the app. Do not include quotes
-  around the value unless they are part of the key.
-- **Gemini API error or unsupported model**: confirm the key is active, has
-  Gemini API access, and `GEMINI_MODEL_ID` is a model ID available to your
-  account.
-- **Slow first question or reranker download failure**: allow internet access
-  to the model hub; the cross-encoder is downloaded separately from Gemini.
-- **CSV not found in summary mode**: pass `--dataset` or set `DATASET_PATH` to
-  the file's location.
+### Docker
+
+Build and run the API:
+
+```powershell
+docker build -t medical-ai .
+docker run --rm -p 8000:8000 --env-file .env `
+  -v "${PWD}\data\chroma:/app/data/chroma" `
+  medical-ai
+```
+
+The volume keeps the ChromaDB index when the container is removed.
+
+## Important limitations
+
+- This is a document search and answer application, not a clinical decision
+  system. Verify outputs against the uploaded source and a qualified clinician.
+- Gemini can be unavailable, rate limited, or return incorrect answers.
+- Uploaded documents and their extracted text may contain sensitive health
+  information. Store and process them only in an environment authorized for
+  that data.
+- The prediction demo uses synthetic data and does not analyze the uploaded
+  healthcare CSV.
+- Uploaded files are retained in `data/documents/`; there is no delete-document
+  endpoint yet.
